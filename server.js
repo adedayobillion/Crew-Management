@@ -1,0 +1,456 @@
+'use strict';
+const express = require('express');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
+const { Pool, types } = require('pg');
+types.setTypeParser(1082, v => v); // keep DATE columns as 'YYYY-MM-DD' strings (no timezone shifts)
+const path = require('path');
+const crypto = require('crypto');
+const bcrypt = require('bcryptjs');
+
+const app = express();
+const PORT = Number(process.env.PORT || 3000);
+const DATABASE_URL = process.env.DATABASE_URL;
+if (!DATABASE_URL) {
+  console.error('DATABASE_URL is missing. Add a Railway PostgreSQL service and attach its DATABASE_URL variable.');
+  process.exit(1);
+}
+const pool = new Pool({
+  connectionString: DATABASE_URL,
+  ssl: /localhost|127\.0\.0\.1/.test(DATABASE_URL) ? false : { rejectUnauthorized: false },
+  max: 10,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 10000
+});
+
+app.disable('x-powered-by');
+app.set('trust proxy', 1); // Railway runs behind a proxy.
+app.use(helmet({ contentSecurityPolicy: { directives: { defaultSrc: ["'self'"], baseUri: ["'self'"], fontSrc: ["'self'", 'https://fonts.gstatic.com', 'data:'], styleSrc: ["'self'", "'unsafe-inline'", 'https://fonts.googleapis.com'], scriptSrc: ["'self'", "'unsafe-inline'"], scriptSrcAttr: ["'unsafe-inline'"], imgSrc: ["'self'", 'data:', 'https:'], connectSrc: ["'self'"], objectSrc: ["'none'"], frameAncestors: ["'none'"], formAction: ["'self'"] } } }));
+app.use(express.json({ limit: '32kb', type: 'application/json' }));
+app.use((req,res,next)=>{ if(req.method !== 'GET' && req.method !== 'HEAD' && req.method !== 'OPTIONS' && req.get('origin')) { const origin = req.get('origin'); const host = req.get('host'); if (!host || origin !== `${req.protocol}://${host}`) return res.status(403).json({error:'Cross-origin requests are not allowed.'}); } next(); });
+app.use('/api/', rateLimit({ windowMs: 15 * 60 * 1000, limit: 180, standardHeaders: 'draft-7', legacyHeaders: false }));
+app.use(express.static(path.join(__dirname, 'public'), { dotfiles: 'ignore' }));
+const registerLimiter = rateLimit({ windowMs: 60 * 60 * 1000, limit: 10, standardHeaders: 'draft-7', legacyHeaders: false, message: { error: 'Too many sign-up attempts. Please wait and try again.' } });
+const emailKey = req => 'e:' + String((req.body && req.body.email) || '').toLowerCase().slice(0,254);
+const loginEmailLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 8, skipSuccessfulRequests: true, keyGenerator: emailKey, standardHeaders: 'draft-7', legacyHeaders: false, message: { error: 'Too many sign-in attempts for this account. Please wait and try again.' } });
+const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 30, skipSuccessfulRequests: true, standardHeaders: 'draft-7', legacyHeaders: false, message: { error: 'Too many sign-in attempts. Please wait and try again.' } });
+const adminLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 20, skipSuccessfulRequests: true, standardHeaders: 'draft-7', legacyHeaders: false, message: { error: 'Too many failed admin attempts. Please wait and try again.' } });
+const DUMMY_HASH = bcrypt.hashSync('timing-equalizer-not-a-real-password', 12);
+
+const seedPros = [
+  {id:1,name:'Tobi Adebayo',role:'Cinematographer',category:'Camera',location:'Lagos',rate:180000,rating:4.9,credits:'8 years experience',desc:'Commercials, music videos and branded visual stories.',skills:['Cinema camera','Lighting','Commercials']},
+  {id:2,name:'Amaka Okorie',role:'Production Manager',category:'Production',location:'Lagos',rate:120000,rating:4.9,credits:'6 years experience',desc:'Schedules, crew coordination and efficient on-set operations.',skills:['Scheduling','Crew calls','Budgets']},
+  {id:3,name:'Daniel Eze',role:'Video Editor',category:'Editing',location:'Remote',rate:85000,rating:4.8,credits:'5 years experience',desc:'Fast-paced edits for campaigns, social and long-form content.',skills:['Premiere Pro','DaVinci','Colour']},
+  {id:4,name:'Mariam Bello',role:'Gaffer / Lighting Tech',category:'Lighting',location:'Lagos',rate:95000,rating:4.8,credits:'7 years experience',desc:'Lighting setups for interviews, commercials and narrative shoots.',skills:['LED systems','Grip','Set safety']},
+  {id:5,name:'Chuka Nwosu',role:'Production Sound Mixer',category:'Sound',location:'Abuja',rate:100000,rating:4.7,credits:'6 years experience',desc:'Location sound recording, dialogue and audio equipment management.',skills:['Boom op','Wireless','Location sound']},
+  {id:6,name:'Zainab Yusuf',role:'Makeup & Creative Artist',category:'Creative',location:'Lagos',rate:70000,rating:4.9,credits:'4 years experience',desc:'Camera-ready makeup and creative looks for talent and campaigns.',skills:['Beauty','Editorial','Set-ready']}
+];
+
+async function initDb() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      id BIGSERIAL PRIMARY KEY,
+      full_name VARCHAR(120) NOT NULL,
+      email VARCHAR(254) NOT NULL UNIQUE,
+      password_hash TEXT NOT NULL,
+      account_type VARCHAR(12) NOT NULL CHECK (account_type IN ('client','crew')),
+      terms_accepted_at TIMESTAMPTZ,
+      terms_version VARCHAR(40),
+      account_status VARCHAR(24) NOT NULL DEFAULT 'approved' CHECK (account_status IN ('pending_review','approved','rejected')),
+      is_verified BOOLEAN NOT NULL DEFAULT FALSE,
+      is_suspicious BOOLEAN NOT NULL DEFAULT FALSE,
+      is_suspended BOOLEAN NOT NULL DEFAULT FALSE,
+      admin_notes TEXT NOT NULL DEFAULT '',
+      reviewed_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS terms_accepted_at TIMESTAMPTZ;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS terms_version VARCHAR(40);
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS account_status VARCHAR(24) NOT NULL DEFAULT 'approved';
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS is_verified BOOLEAN NOT NULL DEFAULT FALSE;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS is_suspicious BOOLEAN NOT NULL DEFAULT FALSE;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS is_suspended BOOLEAN NOT NULL DEFAULT FALSE;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS admin_notes TEXT NOT NULL DEFAULT '';
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS reviewed_at TIMESTAMPTZ;
+    CREATE INDEX IF NOT EXISTS users_admin_review_idx ON users(account_status, is_suspicious, is_suspended, created_at DESC);
+    CREATE TABLE IF NOT EXISTS admin_audit_log (id BIGSERIAL PRIMARY KEY, action VARCHAR(60) NOT NULL, target_user_id BIGINT REFERENCES users(id) ON DELETE SET NULL, details JSONB NOT NULL DEFAULT '{}'::jsonb, actor VARCHAR(80) NOT NULL DEFAULT 'admin-token', ip_address VARCHAR(80), created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());
+    CREATE TABLE IF NOT EXISTS auth_sessions (
+      id BIGSERIAL PRIMARY KEY,
+      user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      token_hash CHAR(64) NOT NULL UNIQUE,
+      expires_at TIMESTAMPTZ NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS auth_sessions_expiry_idx ON auth_sessions(expires_at);
+    CREATE TABLE IF NOT EXISTS professionals (
+      id INTEGER PRIMARY KEY,
+      name VARCHAR(120) NOT NULL,
+      role VARCHAR(120) NOT NULL,
+      category VARCHAR(80) NOT NULL,
+      location VARCHAR(120) NOT NULL,
+      daily_rate BIGINT NOT NULL CHECK (daily_rate >= 0),
+      rating NUMERIC(2,1) NOT NULL DEFAULT 0,
+      credits VARCHAR(160) NOT NULL DEFAULT '',
+      description TEXT NOT NULL DEFAULT '',
+      skills JSONB NOT NULL DEFAULT '[]'::jsonb,
+      active BOOLEAN NOT NULL DEFAULT TRUE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS bookings (
+      id BIGSERIAL PRIMARY KEY,
+      reference VARCHAR(40) UNIQUE NOT NULL,
+      professional_id INTEGER NOT NULL REFERENCES professionals(id),
+      client_name VARCHAR(120) NOT NULL,
+      client_email VARCHAR(254) NOT NULL,
+      project_type VARCHAR(80) NOT NULL,
+      booking_unit VARCHAR(12) NOT NULL CHECK (booking_unit IN ('full','half')),
+      start_date DATE NOT NULL,
+      end_date DATE NOT NULL,
+      project_location VARCHAR(180) NOT NULL,
+      proposed_overtime_terms VARCHAR(1000) NOT NULL DEFAULT '',
+      overtime_agreed BOOLEAN NOT NULL DEFAULT FALSE,
+      project_brief TEXT NOT NULL,
+      days NUMERIC(6,2) NOT NULL,
+      base_amount BIGINT NOT NULL,
+      client_fee BIGINT NOT NULL,
+      crew_commission BIGINT NOT NULL,
+      client_total BIGINT NOT NULL,
+      crew_net BIGINT NOT NULL,
+      agency_gross BIGINT NOT NULL,
+      status VARCHAR(40) NOT NULL DEFAULT 'awaiting_review',
+      payment_status VARCHAR(40) NOT NULL DEFAULT 'not_configured',
+      payout_status VARCHAR(40) NOT NULL DEFAULT 'not_eligible',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS crew_applications (
+      id BIGSERIAL PRIMARY KEY,
+      full_name VARCHAR(120) NOT NULL,
+      email VARCHAR(254) NOT NULL,
+      role VARCHAR(100) NOT NULL,
+      location VARCHAR(120) NOT NULL,
+      portfolio_url TEXT NOT NULL DEFAULT '',
+      bio TEXT NOT NULL,
+      status VARCHAR(40) NOT NULL DEFAULT 'pending_review',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    ALTER TABLE professionals ADD COLUMN IF NOT EXISTS user_id BIGINT REFERENCES users(id) ON DELETE SET NULL;
+    ALTER TABLE professionals ADD COLUMN IF NOT EXISTS application_id BIGINT;
+    ALTER TABLE professionals ALTER COLUMN rating DROP NOT NULL;
+    CREATE SEQUENCE IF NOT EXISTS professionals_id_seq START 1000;
+    CREATE INDEX IF NOT EXISTS professionals_user_idx ON professionals(user_id);
+    ALTER TABLE bookings ADD COLUMN IF NOT EXISTS user_id BIGINT REFERENCES users(id) ON DELETE SET NULL;
+    CREATE INDEX IF NOT EXISTS bookings_user_id_idx ON bookings(user_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS bookings_created_at_idx ON bookings(created_at DESC);
+    CREATE INDEX IF NOT EXISTS bookings_status_idx ON bookings(status);
+    CREATE INDEX IF NOT EXISTS applications_created_at_idx ON crew_applications(created_at DESC);
+  `);
+  for (const p of seedPros) {
+    await pool.query(`INSERT INTO professionals
+      (id,name,role,category,location,daily_rate,rating,credits,description,skills)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb)
+      ON CONFLICT (id) DO NOTHING`,
+      [p.id,p.name,p.role,p.category,p.location,p.rate,0,p.credits,p.desc,JSON.stringify(p.skills)]);
+  }
+}
+function cleanString(value, max, field, {required=true}={}) {
+  if (typeof value !== 'string') throw Object.assign(new Error(`${field} must be text.`), {status:400});
+  const v = value.trim();
+  if (required && !v) throw Object.assign(new Error(`${field} is required.`), {status:400});
+  if (v.length > max) throw Object.assign(new Error(`${field} must be ${max} characters or fewer.`), {status:400});
+  return v;
+}
+function validEmail(value) { return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value); }
+function validDate(value) { return typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value) && !Number.isNaN(Date.parse(value+'T00:00:00Z')) && new Date(value+'T00:00:00Z').toISOString().slice(0,10) === value; }
+function dayCount(start, end) { return Math.floor((Date.parse(end+'T00:00:00Z') - Date.parse(start+'T00:00:00Z')) / 86400000) + 1; }
+function nairaRound(n) { return Math.round(Number(n)); }
+function parseCookies(header='') {
+  const out={}; for (const part of header.split(';').map(v=>v.trim()).filter(Boolean)) { const i=part.indexOf('='); if(i<0) continue; const key=part.slice(0,i); try { out[key]=decodeURIComponent(part.slice(i+1)); } catch { /* Ignore malformed cookie values rather than failing the request. */ } } return out;
+}
+function cookieOptions(maxAgeSeconds) {
+  return `Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAgeSeconds}${process.env.NODE_ENV === 'production' ? '; Secure' : ''}`;
+}
+async function createSession(user, res) {
+  const token=crypto.randomBytes(32).toString('base64url');
+  const hash=crypto.createHash('sha256').update(token).digest('hex');
+  const expiresAt=new Date(Date.now()+7*24*60*60*1000);
+  await pool.query('INSERT INTO auth_sessions(user_id,token_hash,expires_at) VALUES($1,$2,$3)',[user.id,hash,expiresAt]);
+  res.setHeader('Set-Cookie',`cma_session=${encodeURIComponent(token)}; ${cookieOptions(7*24*60*60)}`);
+}
+async function optionalAuth(req,res,next) {
+  try {
+    const token=parseCookies(req.headers.cookie||'').cma_session;
+    if(!token) return next();
+    const hash=crypto.createHash('sha256').update(token).digest('hex');
+    const r=await pool.query(`SELECT u.id,u.full_name,u.email,u.account_type,u.account_status,u.is_verified,u.is_suspicious,u.is_suspended,s.id AS session_id FROM auth_sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=$1 AND s.expires_at>NOW()`,[hash]);
+    if(r.rowCount) { const u=r.rows[0]; if(u.is_suspended) { await pool.query('DELETE FROM auth_sessions WHERE id=$1',[u.session_id]); return res.status(403).json({error:'This account is suspended. Contact support.',code:'ACCOUNT_SUSPENDED'}); } req.user={id:u.id,name:u.full_name,email:u.email,accountType:u.account_type,accountStatus:u.account_status,isVerified:u.is_verified,isSuspicious:u.is_suspicious,sessionId:u.session_id}; }
+    next();
+  } catch(e) { next(e); }
+}
+function requireAuth(req,res,next) {
+  optionalAuth(req,res,err=>{if(err)return next(err);if(!req.user)return res.status(401).json({error:'Please sign in to continue.',code:'AUTH_REQUIRED'});next();});
+}
+function requireRole(role) { return (req,res,next)=>{if(!req.user)return res.status(401).json({error:'Please sign in to continue.',code:'AUTH_REQUIRED'});if(req.user.accountType!==role)return res.status(403).json({error:`This action requires a ${role} account.`});if(req.user.accountStatus!=='approved')return res.status(403).json({error:req.user.accountStatus==='rejected'?'This account was not approved. Contact support.':'Your account is awaiting admin approval.',code:'ACCOUNT_NOT_APPROVED'});next();}; }
+function publicUser(user) { return {id:user.id,name:user.name||user.full_name,email:user.email,accountType:user.accountType||user.account_type,accountStatus:user.accountStatus||user.account_status||'approved',isVerified:user.isVerified??user.is_verified??false,isSuspicious:user.isSuspicious??user.is_suspicious??false}; }
+
+function adminOnly(req,res,next) {
+  const expected = process.env.CMA_ADMIN_TOKEN;
+  if (!expected) return res.status(503).json({error:'Admin API disabled: configure CMA_ADMIN_TOKEN in Railway Variables.'});
+  const supplied = req.get('x-admin-token') || '';
+  const suppliedBuf = Buffer.from(supplied); const expectedBuf = Buffer.from(expected);
+  if (suppliedBuf.length !== expectedBuf.length || !crypto.timingSafeEqual(suppliedBuf, expectedBuf)) return res.status(401).json({error:'Unauthorized'});
+  next();
+}
+
+app.get('/api/health', async (_req,res) => {
+  try { await pool.query('SELECT 1'); res.json({ok:true, service:'crew-management-agency', database:'connected', paymentsEnabled: process.env.PAYMENTS_ENABLED === 'true'}); }
+  catch (e) { res.status(503).json({ok:false,database:'unavailable'}); }
+});
+app.get('/api/config', (_req,res) => res.json({currency:'NGN',clientFeePercent:10,crewCommissionPercent:10,paymentsEnabled:process.env.PAYMENTS_ENABLED === 'true',paymentProvider:'Bachs.io (not connected)',payoutPolicy:'After project completion; subject to provider capability and dispute rules'}));
+app.post('/api/auth/register', registerLimiter, async (req,res,next) => {
+  try {
+    const b=req.body||{};
+    const name=cleanString(b.name,120,'Full name');
+    const email=cleanString(b.email,254,'Email').toLowerCase();
+    const password=cleanString(b.password,200,'Password');
+    const accountType=b.accountType;
+    if(!validEmail(email)) return res.status(400).json({error:'Enter a valid email address.'});
+    if(password.length<10 || !/[A-Za-z]/.test(password) || !/\d/.test(password)) return res.status(400).json({error:'Use at least 10 characters with at least one letter and one number.'});
+    if(!['client','crew'].includes(accountType)) return res.status(400).json({error:'Choose a client or crew account.'});
+    if (b.termsAccepted !== true) return res.status(400).json({error:'Please accept the Terms of Service and acknowledge the Privacy Policy.'});
+    const passwordHash=await bcrypt.hash(password,12);
+    let saved;
+    try { saved=await pool.query("INSERT INTO users(full_name,email,password_hash,account_type,account_status,terms_accepted_at,terms_version) VALUES($1,$2,$3,$4,'pending_review',NOW(),'2026-10-19-draft') RETURNING id,full_name,email,account_type,account_status,is_verified,is_suspicious",[name,email,passwordHash,accountType]); }
+    catch(e) { if(e.code==='23505')return res.status(409).json({error:'An account with this email already exists. Sign in instead.'}); throw e; }
+    const user=saved.rows[0];
+    await createSession(user,res);
+    res.status(201).json({user:publicUser(user),message:'Account created successfully.'});
+  } catch(e) { next(e); }
+});
+app.post('/api/auth/login', authLimiter, loginEmailLimiter, async (req,res,next) => {
+  try {
+    const email=cleanString((req.body||{}).email,254,'Email').toLowerCase();
+    const password=cleanString((req.body||{}).password,200,'Password');
+    const r=await pool.query('SELECT id,full_name,email,password_hash,account_type,account_status,is_verified,is_suspicious,is_suspended FROM users WHERE email=$1',[email]);
+    const okPw=await bcrypt.compare(password,r.rowCount?r.rows[0].password_hash:DUMMY_HASH);
+    if(!r.rowCount || !okPw) return res.status(401).json({error:'Email or password is incorrect.'});
+    const user=r.rows[0]; if(user.is_suspended || user.account_status==='rejected') return res.status(403).json({error:user.is_suspended?'This account is suspended. Contact support.':'This account was not approved. Contact support.',code:'ACCOUNT_RESTRICTED'}); await createSession(user,res);
+    res.json({user:publicUser(user),message:'Signed in successfully.'});
+  } catch(e) { next(e); }
+});
+app.get('/api/auth/me', optionalAuth, (req,res) => res.json({user:req.user?publicUser(req.user):null}));
+app.post('/api/auth/logout', async (req,res,next) => {
+  try { const tok=parseCookies(req.headers.cookie||'').cma_session; if(tok) await pool.query('DELETE FROM auth_sessions WHERE token_hash=$1',[crypto.createHash('sha256').update(tok).digest('hex')]); res.setHeader('Set-Cookie',`cma_session=; ${cookieOptions(0)}`);res.json({ok:true}); }
+  catch(e){next(e);}
+});
+app.get('/api/my/bookings', requireAuth, async (req,res,next) => {
+  try { const r=await pool.query(`SELECT b.reference,b.project_type,b.booking_unit,b.start_date,b.end_date,b.project_location,b.days,b.base_amount,b.client_fee,b.crew_commission,b.client_total,b.crew_net,b.agency_gross,b.status,b.payment_status,b.payout_status,b.created_at,p.name AS professional_name,p.role AS professional_role FROM bookings b JOIN professionals p ON p.id=b.professional_id WHERE b.user_id=$1 ORDER BY b.created_at DESC LIMIT 100`,[req.user.id]);res.json({bookings:r.rows}); }
+  catch(e){next(e);}
+});
+app.get('/api/professionals', async (req,res,next) => {
+  try {
+    const {category,location,q} = req.query;
+    const result = await pool.query(`SELECT id,name,role,category,location,daily_rate AS rate,credits,description AS "desc",skills
+      FROM professionals WHERE active=TRUE AND ($1::text IS NULL OR category=$1) AND ($2::text IS NULL OR location=$2)
+      AND ($3::text IS NULL OR (name || ' ' || role || ' ' || category || ' ' || description) ILIKE '%' || $3 || '%') ORDER BY id`,
+      [category || null, location || null, q || null]);
+    res.json({professionals:result.rows});
+  } catch(e) { next(e); }
+});
+app.post('/api/bookings', requireAuth, requireRole('client'), async (req,res,next) => {
+  try {
+    const b = req.body || {};
+    const professionalId = Number(b.professionalId);
+    if (!Number.isSafeInteger(professionalId) || professionalId < 1) return res.status(400).json({error:'A valid professionalId is required.'});
+    const clientName = req.user.name;
+    const clientEmail = req.user.email;
+    const projectType = cleanString(b.projectType,80,'Project type');
+    const bookingUnit = b.bookingUnit;
+    if (!['full','half'].includes(bookingUnit)) return res.status(400).json({error:'Booking type must be full or half.'});
+    const startDate = b.startDate;
+    const endDate = bookingUnit === 'half' ? startDate : b.endDate;
+    if (!validDate(startDate) || !validDate(endDate) || endDate < startDate) return res.status(400).json({error:'Choose valid start and end dates; end date must not be before start date.'});
+    const days = bookingUnit === 'half' ? 0.5 : dayCount(startDate,endDate);
+    const today = new Date(Date.now() + 60*60*1000).toISOString().slice(0,10); // Lagos (UTC+1) calendar date
+    if (startDate < today) return res.status(400).json({error:'Start date cannot be in the past.'});
+    if (days > 60) return res.status(400).json({error:'A single booking cannot exceed 60 calendar days in this test version.'});
+    const projectLocation = cleanString(b.projectLocation,180,'Production location');
+    const overtimeTerms = cleanString(b.overtimeTerms || '',1000,'Overtime terms',{required:false});
+    const brief = cleanString(b.brief,8000,'Project brief');
+    const recent = await pool.query("SELECT COUNT(*)::int AS n FROM bookings WHERE user_id=$1 AND created_at > NOW() - INTERVAL '24 hours'",[req.user.id]);
+    if (recent.rows[0].n >= 10) return res.status(429).json({error:'Daily booking request limit reached. Please try again tomorrow.'});
+    const proResult = await pool.query('SELECT id,name,role,daily_rate FROM professionals WHERE id=$1 AND active=TRUE',[professionalId]);
+    if (!proResult.rowCount) return res.status(404).json({error:'Professional not found or inactive.'});
+    const p = proResult.rows[0];
+    const base = nairaRound(Number(p.daily_rate) * days);
+    const clientFee = nairaRound(base * 0.10);
+    const crewCommission = nairaRound(base * 0.10);
+    const clientTotal = base + clientFee;
+    const crewNet = base - crewCommission;
+    const agencyGross = clientFee + crewCommission;
+    const reference = 'CMA-' + require('crypto').randomBytes(5).toString('hex').toUpperCase();
+    const saved = await pool.query(`INSERT INTO bookings
+      (reference,user_id,professional_id,client_name,client_email,project_type,booking_unit,start_date,end_date,project_location,proposed_overtime_terms,project_brief,days,base_amount,client_fee,crew_commission,client_total,crew_net,agency_gross)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+      RETURNING reference,status,payment_status,payout_status,days,base_amount,client_fee,crew_commission,client_total,crew_net,agency_gross,created_at`,
+      [reference,req.user.id,professionalId,clientName,clientEmail,projectType,bookingUnit,startDate,endDate,projectLocation,overtimeTerms,brief,days,base,clientFee,crewCommission,clientTotal,crewNet,agencyGross]);
+    res.status(201).json({message:'Booking request saved. This is not a confirmed booking and no payment has been taken.',booking:{...saved.rows[0],professionalName:p.name,professionalRole:p.role,bookingUnit,startDate,endDate,projectLocation,overtimeTerms},paymentsEnabled:process.env.PAYMENTS_ENABLED === 'true'});
+  } catch(e) { next(e); }
+});
+app.post('/api/crew-applications', requireAuth, requireRole('crew'), async (req,res,next) => {
+  try {
+    const b=req.body||{};
+    const name=req.user.name;
+    const email=req.user.email;
+    const role=cleanString(b.role,100,'Primary role');
+    const location=cleanString(b.location,120,'Base location');
+    const portfolio=cleanString(b.portfolio || '',1000,'Portfolio URL',{required:false});
+    if(portfolio && !/^https:\/\//i.test(portfolio)) return res.status(400).json({error:'Portfolio link must start with https://'});
+    const bio=cleanString(b.bio,5000,'Skills and experience');
+    const dup=await pool.query("SELECT 1 FROM crew_applications WHERE lower(email)=lower($1) AND status='pending_review'",[email]);
+    if(dup.rowCount) return res.status(409).json({error:'You already have an application awaiting review.'});
+    const saved=await pool.query(`INSERT INTO crew_applications(full_name,email,role,location,portfolio_url,bio) VALUES($1,$2,$3,$4,$5,$6) RETURNING id,status,created_at`,[name,email,role,location,portfolio,bio]);
+    res.status(201).json({message:'Crew application received for review.',application:saved.rows[0]});
+  } catch(e) { next(e); }
+});
+// Admin endpoints are protected by a server-side secret; never embed CMA_ADMIN_TOKEN in public website code.
+app.get('/api/admin/overview', adminLimiter, adminOnly, async (_req,res,next) => {
+  try {
+    const [counts, recent] = await Promise.all([
+      pool.query(`SELECT COUNT(*)::int AS total, COUNT(*) FILTER (WHERE account_status='pending_review')::int AS pending, COUNT(*) FILTER (WHERE is_verified)::int AS verified, COUNT(*) FILTER (WHERE is_suspicious)::int AS suspicious, COUNT(*) FILTER (WHERE is_suspended)::int AS suspended, COUNT(*) FILTER (WHERE account_type='crew')::int AS crew, COUNT(*) FILTER (WHERE account_type='client')::int AS clients FROM users`),
+      pool.query(`SELECT id,full_name,email,account_type,account_status,is_verified,is_suspicious,is_suspended,created_at FROM users ORDER BY CASE WHEN is_suspended THEN 0 WHEN is_suspicious THEN 1 WHEN account_status='pending_review' THEN 2 ELSE 3 END, created_at DESC LIMIT 8`)
+    ]);
+    res.json({stats:counts.rows[0],recentUsers:recent.rows});
+  } catch(e){next(e);}
+});
+app.get('/api/admin/users', adminLimiter, adminOnly, async (req,res,next) => {
+  try {
+    const status = ['all','pending_review','approved','rejected'].includes(req.query.status) ? req.query.status : 'all';
+    const filter = ['all','suspicious','suspended','unverified'].includes(req.query.filter) ? req.query.filter : 'all';
+    const q = typeof req.query.q === 'string' ? req.query.q.trim().slice(0,100) : '';
+    const r = await pool.query(`SELECT id,full_name,email,account_type,account_status,is_verified,is_suspicious,is_suspended,admin_notes,terms_accepted_at,terms_version,created_at,reviewed_at FROM users WHERE ($1='all' OR account_status=$1) AND ($2='all' OR ($2='suspicious' AND is_suspicious=TRUE) OR ($2='suspended' AND is_suspended=TRUE) OR ($2='unverified' AND is_verified=FALSE)) AND ($3='' OR full_name ILIKE '%'||$3||'%' OR email ILIKE '%'||$3||'%') ORDER BY CASE WHEN is_suspended THEN 0 WHEN is_suspicious THEN 1 WHEN account_status='pending_review' THEN 2 ELSE 3 END, created_at DESC LIMIT 300`,[status,filter,q]);
+    res.json({users:r.rows});
+  } catch(e){next(e);}
+});
+app.patch('/api/admin/users/:id/action', adminLimiter, adminOnly, async (req,res,next) => {
+  const client = await pool.connect();
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isSafeInteger(id) || id < 1) return res.status(400).json({error:'Invalid account ID.'});
+    const action = req.body && req.body.action;
+    const notes = typeof (req.body||{}).notes === 'string' ? req.body.notes.trim().slice(0,2000) : null;
+    const allowed = ['approve','reject','verify','unverify','flag_suspicious','clear_suspicious','suspend','reactivate','save_notes'];
+    if(!allowed.includes(action)) return res.status(400).json({error:'Invalid account action.'});
+    await client.query('BEGIN');
+    let sql, params;
+    if(action==='approve'){sql="UPDATE users SET account_status='approved',reviewed_at=NOW() WHERE id=$1";params=[id];}
+    else if(action==='reject'){sql="UPDATE users SET account_status='rejected',reviewed_at=NOW() WHERE id=$1";params=[id];}
+    else if(action==='verify'){sql='UPDATE users SET is_verified=TRUE,reviewed_at=NOW() WHERE id=$1';params=[id];}
+    else if(action==='unverify'){sql='UPDATE users SET is_verified=FALSE,reviewed_at=NOW() WHERE id=$1';params=[id];}
+    else if(action==='flag_suspicious'){sql='UPDATE users SET is_suspicious=TRUE,reviewed_at=NOW() WHERE id=$1';params=[id];}
+    else if(action==='clear_suspicious'){sql='UPDATE users SET is_suspicious=FALSE,reviewed_at=NOW() WHERE id=$1';params=[id];}
+    else if(action==='suspend'){sql='UPDATE users SET is_suspended=TRUE,reviewed_at=NOW() WHERE id=$1';params=[id];}
+    else if(action==='reactivate'){sql='UPDATE users SET is_suspended=FALSE,reviewed_at=NOW() WHERE id=$1';params=[id];}
+    else { if(notes===null){await client.query('ROLLBACK');return res.status(400).json({error:'Notes must be text.'});} sql='UPDATE users SET admin_notes=$2,reviewed_at=NOW() WHERE id=$1';params=[id,notes]; }
+    const updated=await client.query(sql+' RETURNING id,full_name,email,account_type,account_status,is_verified,is_suspicious,is_suspended,admin_notes,created_at,reviewed_at',params);
+    if(!updated.rowCount){await client.query('ROLLBACK');return res.status(404).json({error:'Account not found.'});}
+    if(action==='suspend' || action==='reject') await client.query('DELETE FROM auth_sessions WHERE user_id=$1',[id]);
+    await client.query('INSERT INTO admin_audit_log(action,target_user_id,details,ip_address) VALUES($1,$2,$3::jsonb,$4)',[action,id,JSON.stringify({notes:action==='save_notes'?'updated':undefined}),String(req.ip||'').slice(0,80)]);
+    await client.query('COMMIT');
+    res.json({user:updated.rows[0],message:'Account action saved.'});
+  } catch(e){await client.query('ROLLBACK').catch(()=>{});next(e);} finally{client.release();}
+});
+app.get('/api/admin/audit-log', adminLimiter, adminOnly, async (_req,res,next) => {
+  try {const r=await pool.query(`SELECT a.id,a.action,a.target_user_id,a.details,a.ip_address,a.created_at,u.full_name AS target_name,u.email AS target_email FROM admin_audit_log a LEFT JOIN users u ON u.id=a.target_user_id ORDER BY a.created_at DESC LIMIT 200`);res.json({events:r.rows});}
+  catch(e){next(e);}
+});
+app.get('/api/admin/bookings', adminLimiter, adminOnly, async (req,res,next) => {
+  try { const r=await pool.query(`SELECT b.reference,b.client_name,b.client_email,p.name AS professional_name,p.role,b.project_type,b.booking_unit,b.start_date,b.end_date,b.project_location,b.proposed_overtime_terms,b.overtime_agreed,b.days,b.base_amount,b.client_fee,b.crew_commission,b.client_total,b.crew_net,b.agency_gross,b.status,b.payment_status,b.payout_status,b.created_at FROM bookings b JOIN professionals p ON p.id=b.professional_id ORDER BY b.created_at DESC LIMIT 250`); res.json({bookings:r.rows}); }
+  catch(e){next(e);}
+});
+app.get('/api/admin/applications', adminLimiter, adminOnly, async (_req,res,next) => {
+  try { const r=await pool.query('SELECT id,full_name,email,role,location,portfolio_url,bio,status,created_at FROM crew_applications ORDER BY created_at DESC LIMIT 250'); res.json({applications:r.rows}); }
+  catch(e){next(e);}
+});
+function audit(action, req, details={}, targetUserId=null) { return pool.query('INSERT INTO admin_audit_log(action,target_user_id,details,ip_address) VALUES($1,$2,$3::jsonb,$4)',[action,targetUserId,JSON.stringify(details),String(req.ip||'').slice(0,80)]); }
+const BOOKING_FLOW = {
+  awaiting_review:['awaiting_terms','cancelled'],
+  awaiting_terms:['awaiting_review','confirmed','cancelled'],
+  confirmed:['in_progress','cancelled','disputed'],
+  in_progress:['completion_review','disputed','cancelled'],
+  completion_review:['completed','disputed'],
+  completed:['disputed'],
+  disputed:['completed','cancelled','refunded'],
+  cancelled:['refunded'],
+  refunded:[]
+};
+app.patch('/api/admin/bookings/:reference/status', adminLimiter, adminOnly, async (req,res,next) => {
+  try {
+    const status=req.body && req.body.status;
+    if(!Object.keys(BOOKING_FLOW).includes(status)) return res.status(400).json({error:'Invalid status.'});
+    const cur=await pool.query('SELECT status,payment_status,overtime_agreed FROM bookings WHERE reference=$1',[req.params.reference]);
+    if(!cur.rowCount) return res.status(404).json({error:'Booking not found.'});
+    const from=cur.rows[0];
+    if(!BOOKING_FLOW[from.status].includes(status)) return res.status(409).json({error:`Cannot move a booking from ${from.status} to ${status}.`});
+    if(status==='refunded' && from.payment_status==='not_configured') return res.status(409).json({error:'No payment was collected, so nothing can be refunded.'});
+    if(status==='confirmed' && !from.overtime_agreed) { const t=await pool.query("SELECT proposed_overtime_terms FROM bookings WHERE reference=$1",[req.params.reference]); if(t.rows[0].proposed_overtime_terms) return res.status(409).json({error:'Overtime terms were proposed but are not marked agreed. Mark them agreed before confirming.'}); }
+    const r=await pool.query('UPDATE bookings SET status=$1 WHERE reference=$2 RETURNING reference,status,payment_status,payout_status',[status,req.params.reference]);
+    await audit('booking_status',req,{reference:req.params.reference,from:from.status,status});
+    res.json({booking:r.rows[0]});
+  }catch(e){next(e);}
+});
+app.patch('/api/admin/bookings/:reference/overtime-agreed', adminLimiter, adminOnly, async (req,res,next) => {
+  try {
+    if(typeof (req.body||{}).agreed!=='boolean') return res.status(400).json({error:'agreed must be true or false.'});
+    const r=await pool.query('UPDATE bookings SET overtime_agreed=$1 WHERE reference=$2 RETURNING reference,overtime_agreed',[req.body.agreed,req.params.reference]);
+    if(!r.rowCount) return res.status(404).json({error:'Booking not found.'});
+    await audit('booking_overtime',req,{reference:req.params.reference,agreed:req.body.agreed});
+    res.json({booking:r.rows[0]});
+  }catch(e){next(e);}
+});
+app.patch('/api/admin/applications/:id/status', adminLimiter, adminOnly, async (req,res,next) => {
+  try {
+    const id=Number(req.params.id); const status=(req.body||{}).status;
+    if(!Number.isSafeInteger(id)||id<1) return res.status(400).json({error:'Invalid application ID.'});
+    if(!['pending_review','approved','rejected'].includes(status)) return res.status(400).json({error:'Invalid status.'});
+    const r=await pool.query('UPDATE crew_applications SET status=$1 WHERE id=$2 RETURNING id,status',[status,id]);
+    if(!r.rowCount) return res.status(404).json({error:'Application not found.'});
+    await audit('application_status',req,{applicationId:id,status});
+    res.json({application:r.rows[0]});
+  }catch(e){next(e);}
+});
+// Turns an approved crew application into a bookable profile linked to the crew user's account.
+app.post('/api/admin/applications/:id/create-profile', adminLimiter, adminOnly, async (req,res,next) => {
+  try {
+    const id=Number(req.params.id); const b=req.body||{};
+    const dailyRate=Number(b.dailyRate); const category=cleanString(b.category,80,'Category');
+    if(!Number.isSafeInteger(id)||id<1) return res.status(400).json({error:'Invalid application ID.'});
+    if(!Number.isSafeInteger(dailyRate)||dailyRate<1||dailyRate>100000000) return res.status(400).json({error:'Enter a valid daily rate in whole naira.'});
+    const a=await pool.query('SELECT * FROM crew_applications WHERE id=$1',[id]);
+    if(!a.rowCount) return res.status(404).json({error:'Application not found.'});
+    const app_=a.rows[0];
+    const u=await pool.query("SELECT id FROM users WHERE email=$1 AND account_type='crew' AND account_status='approved' AND is_suspended=FALSE",[String(app_.email).toLowerCase()]);
+    if(!u.rowCount) return res.status(409).json({error:'No approved, active crew account matches this application email.'});
+    if((await pool.query('SELECT 1 FROM professionals WHERE application_id=$1',[id])).rowCount) return res.status(409).json({error:'A profile already exists for this application.'});
+    const saved=await pool.query(`INSERT INTO professionals(id,name,role,category,location,daily_rate,rating,credits,description,skills,user_id,application_id) VALUES(nextval('professionals_id_seq'),$1,$2,$3,$4,$5,0,'',$6,'[]'::jsonb,$7,$8) RETURNING id,name,role,category,location,daily_rate`,[app_.full_name,app_.role,category,app_.location,dailyRate,String(app_.bio).slice(0,500),u.rows[0].id,id]);
+    await pool.query("UPDATE crew_applications SET status='approved' WHERE id=$1",[id]);
+    await audit('create_profile',req,{applicationId:id,professionalId:saved.rows[0].id},u.rows[0].id);
+    res.status(201).json({professional:saved.rows[0]});
+  }catch(e){next(e);}
+});
+// Crew accounts can see booking requests made for their linked profile.
+app.get('/api/my/crew-bookings', requireAuth, requireRole('crew'), async (req,res,next) => {
+  try { const r=await pool.query(`SELECT b.reference,b.project_type,b.booking_unit,b.start_date,b.end_date,b.project_location,b.proposed_overtime_terms,b.days,b.base_amount,b.crew_commission,b.crew_net,b.status,b.created_at FROM bookings b JOIN professionals p ON p.id=b.professional_id WHERE p.user_id=$1 ORDER BY b.created_at DESC LIMIT 100`,[req.user.id]); res.json({bookings:r.rows}); }
+  catch(e){next(e);}
+});
+app.use('/api', (_req,res)=>res.status(404).json({error:'API route not found.'}));
+app.get('*', (req,res,next) => { if(req.path.startsWith('/api/')) return next(); res.sendFile(path.join(__dirname,'public','index.html')); });
+app.use((err,_req,res,_next)=>{
+  console.error(err && err.stack ? err.stack : err);
+  const status=Number(err.status)||500;
+  res.status(status).json({error:status===500?'Server error. Check Railway logs for details.':err.message});
+});
+
+initDb().then(()=>{
+  app.listen(PORT,'0.0.0.0',()=>console.log(`Crew Management Agency listening on port ${PORT}`));
+}).catch(err=>{console.error('Database initialization failed:',err);process.exit(1);});
+process.on('SIGTERM',async()=>{await pool.end();process.exit(0);});
